@@ -1,0 +1,42 @@
+{
+  // This will show up in the VS Code UI as e.g. "<repo>-sandboxed-gpu"
+  "name": "${localWorkspaceFolderBasename}-sandboxed-gpu",
+
+  "image": "nvidia/cuda:12.5.1-runtime-ubuntu22.04",
+  "runArgs": ["--gpus=all", "--ipc=host"],
+
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "installOhMyZsh": false,
+      "installGit": true
+    },
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    }
+  },
+
+  // Mount ONLY the repo; the container can't see anything else on the host
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+
+  // Persist venv + pip cache so we don't reinstall every time.
+  // Volume names are derived from the repo folder name.
+  "mounts": [
+    "source=${localWorkspaceFolderBasename}_venv,type=volume,target=/workspace/.venv",
+    "source=vscode_devcontainer_shared_pip_cache,type=volume,target=/root/.cache/pip"
+  ],
+
+  // Create the venv once if it doesn't exist; otherwise skip
+  "postCreateCommand": "set -e; REQS_FILE='requirements.txt'; if [ ! -x /workspace/.venv/bin/python ]; then python3.11 -m venv /workspace/.venv; fi; /workspace/.venv/bin/pip install -U pip; if [ ! -f \"$REQS_FILE\" ]; then echo 'pip installation requirements not found' >&2; exit 1; fi; /workspace/.venv/bin/pip install -r \"$REQS_FILE\" --extra-index-url https://download.pytorch.org/whl/cu118",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/workspace/.venv/bin/python",
+        "python.terminal.activateEnvironment": true
+      },
+      "extensions": ["ms-python.python", "ms-python.vscode-pylance", "openai.chatgpt"]
+    }
+  }
+}
