@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence
 
 import torch
@@ -57,6 +57,9 @@ class MuZeroConfig:
     hidden_dim: int = 64
     action_embed_dim: int = 16
     seed: int = 0
+    eval_interval: int = 20
+    eval_games_per_side: int = 20
+    eval_num_simulations: int = 100
     known_bounds: KnownBounds = field(default_factory=lambda: KnownBounds(-1.0, 1.0))
 
     def visit_softmax_temperature(self, num_moves: int) -> float:
@@ -352,6 +355,13 @@ def select_action(config: MuZeroConfig, num_moves: int, root: Node) -> int:
     return random.choices(actions, weights=probs, k=1)[0]
 
 
+def select_action_greedy(root: Node) -> int:
+    if not root.children:
+        raise RuntimeError("No actions available for selection.")
+    best_action = max(root.children.items(), key=lambda item: item[1].visit_count)[0]
+    return best_action
+
+
 @dataclass
 class Target:
     value: float
@@ -444,6 +454,24 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+@dataclass
+class EvalResult:
+    step: int
+    wins: int
+    draws: int
+    losses: int
+
+    @property
+    def total(self) -> int:
+        return self.wins + self.draws + self.losses
+
+    def rates(self) -> tuple[float, float, float]:
+        total = self.total
+        if total == 0:
+            return 0.0, 0.0, 0.0
+        return self.wins / total, self.draws / total, self.losses / total
+
+
 def play_game(config: MuZeroConfig, network: MuZeroNetwork, device: torch.device) -> GameHistory:
     env = TicTacToe()
     history = GameHistory()
@@ -470,6 +498,97 @@ def play_game(config: MuZeroConfig, network: MuZeroNetwork, device: torch.device
         num_moves += 1
 
     return history
+
+
+def play_match_vs_random(
+    network: MuZeroNetwork,
+    config: MuZeroConfig,
+    device: torch.device,
+    network_player: int,
+) -> int:
+    env = TicTacToe()
+    num_moves = 0
+    eval_simulations = config.eval_num_simulations if config.eval_num_simulations > 0 else config.num_simulations
+    eval_config = replace(config, num_simulations=eval_simulations)
+
+    while not env.is_terminal() and num_moves < config.max_moves:
+        if env.to_play == network_player:
+            root = Node(0.0)
+            with torch.no_grad():
+                network_output = network.initial_inference(env.make_observation().unsqueeze(0).to(device))
+            expand_node(root, env.to_play, env.legal_actions(), network_output)
+            run_mcts(eval_config, root, env, network, device)
+            action = select_action_greedy(root)
+        else:
+            action = random.choice(env.legal_actions())
+        env.apply(action)
+        num_moves += 1
+
+    winner = env.check_winner()
+    if winner == 0:
+        return 0
+    return 1 if winner == network_player else -1
+
+
+def evaluate_vs_random(
+    network: MuZeroNetwork,
+    config: MuZeroConfig,
+    device: torch.device,
+    step: int,
+) -> EvalResult:
+    wins = 0
+    draws = 0
+    losses = 0
+    games_per_side = max(config.eval_games_per_side, 0)
+
+    was_training = network.training
+    network.eval()
+    for player in (1, -1):
+        for _ in range(games_per_side):
+            outcome = play_match_vs_random(network, config, device, player)
+            if outcome > 0:
+                wins += 1
+            elif outcome < 0:
+                losses += 1
+            else:
+                draws += 1
+    if was_training:
+        network.train()
+    return EvalResult(step=step, wins=wins, draws=draws, losses=losses)
+
+
+def plot_eval_history(eval_history: Sequence[EvalResult], output_path: str) -> None:
+    if not eval_history:
+        print("No evaluation data to plot.")
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    steps = [item.step for item in eval_history]
+    win_rates = []
+    draw_rates = []
+    loss_rates = []
+    for item in eval_history:
+        win_rate, draw_rate, loss_rate = item.rates()
+        win_rates.append(win_rate)
+        draw_rates.append(draw_rate)
+        loss_rates.append(loss_rate)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, win_rates, label="Win", linewidth=2)
+    plt.plot(steps, draw_rates, label="Draw", linewidth=2)
+    plt.plot(steps, loss_rates, label="Loss", linewidth=2)
+    plt.xlabel("Training step")
+    plt.ylabel("Rate")
+    plt.ylim(0.0, 1.0)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"Saved plot to {output_path}")
 
 
 def loss_for_step(
@@ -515,13 +634,16 @@ def update_weights(
     return float(total_loss.item())
 
 
-def train(config: MuZeroConfig, device: torch.device) -> MuZeroNetwork:
+def train(config: MuZeroConfig, device: torch.device) -> tuple[MuZeroNetwork, List[EvalResult]]:
     random.seed(config.seed)
     torch.manual_seed(config.seed)
 
     network = MuZeroNetwork(config).to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     replay_buffer = ReplayBuffer(config)
+    eval_history: List[EvalResult] = []
+
+    last_loss: Optional[float] = None
 
     for step in range(config.training_steps):
         game = play_game(config, network, device)
@@ -530,11 +652,24 @@ def train(config: MuZeroConfig, device: torch.device) -> MuZeroNetwork:
             continue
         for _ in range(config.training_steps_per_game):
             batch = replay_buffer.sample_batch()
-            loss = update_weights(network, optimizer, batch, device)
+            last_loss = update_weights(network, optimizer, batch, device)
         if (step + 1) % 10 == 0:
-            print(f"Step {step + 1}: replay={len(replay_buffer)} loss={loss:.4f}")
+            loss_display = f"{last_loss:.4f}" if last_loss is not None else "n/a"
+            print(f"Step {step + 1}: replay={len(replay_buffer)} loss={loss_display}")
+        if config.eval_interval > 0 and (step + 1) % config.eval_interval == 0:
+            result = evaluate_vs_random(network, config, device, step + 1)
+            win_rate, draw_rate, loss_rate = result.rates()
+            print(
+                "Eval step "
+                f"{result.step}: win={win_rate:.2f} draw={draw_rate:.2f} loss={loss_rate:.2f}"
+            )
+            eval_history.append(result)
 
-    return network
+    if config.eval_interval > 0 and (not eval_history or eval_history[-1].step != config.training_steps):
+        result = evaluate_vs_random(network, config, device, config.training_steps)
+        eval_history.append(result)
+
+    return network, eval_history
 
 
 def play_against_random(network: MuZeroNetwork, config: MuZeroConfig, device: torch.device) -> None:
@@ -564,6 +699,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MuZero Tic Tac Toe (PyTorch)")
     parser.add_argument("--training-steps", type=int, default=200)
     parser.add_argument("--num-simulations", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--training-steps-per-game", type=int, default=10)
+    parser.add_argument("--min-replay-size", type=int, default=10)
+    parser.add_argument("--eval-interval", type=int, default=20)
+    parser.add_argument("--eval-games-per-side", type=int, default=20)
+    parser.add_argument("--eval-num-simulations", type=int, default=100)
+    parser.add_argument("--plot-path", type=str, default="muzero_tictactoe_training_eval.png")
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--play", action="store_true")
     return parser.parse_args()
@@ -571,11 +713,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = MuZeroConfig(training_steps=args.training_steps, num_simulations=args.num_simulations)
+    config = MuZeroConfig(
+        training_steps=args.training_steps,
+        num_simulations=args.num_simulations,
+        batch_size=args.batch_size,
+        training_steps_per_game=args.training_steps_per_game,
+        min_replay_size=args.min_replay_size,
+        eval_interval=args.eval_interval,
+        eval_games_per_side=args.eval_games_per_side,
+        eval_num_simulations=args.eval_num_simulations,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network = MuZeroNetwork(config).to(device)
     if args.train:
-        network = train(config, device)
+        network, eval_history = train(config, device)
+        plot_eval_history(eval_history, args.plot_path)
     if args.play:
         play_against_random(network, config, device)
 
